@@ -1,0 +1,49 @@
+<?php
+/**
+ * Delete a single consolidated requirement.
+ * The M:N source links and any conflicts referencing this row are
+ * cleaned up automatically by ON DELETE CASCADE.
+ */
+session_start(['read_and_close' => true]);
+require_once '../../config.php';
+require_once '../../includes/functions.php';
+
+// Changes data: never on a GET, which a link on another site can send (csrf.php).
+csrfRequireWriteMethod();
+
+header('Content-Type: application/json');
+
+if (!isset($_SESSION['analyst_id'])) {
+    echo json_encode(['success' => false, 'error' => 'Not authenticated']);
+    exit;
+}
+
+// The RFP Builder is part of the Contracts module — its PAGES have always checked
+// this, its endpoints never did. Any logged-in analyst could read, edit or delete
+// any RFP by calling the API directly. (Found by debug tool D005.)
+requireModuleAccessJson('contracts');
+// The RFP's company (3.5.0): one in a company this analyst cannot reach is "not found".
+require_once '../../includes/rfp_scope.php';
+rfpGate('consolidated', 'id');
+try {
+    $data = json_decode(file_get_contents('php://input'), true);
+    $id = isset($data['id']) ? (int)$data['id'] : 0;
+    if ($id <= 0) throw new Exception('Missing or invalid id');
+
+    $conn = connectToDatabase();
+
+    $row = $conn->prepare("SELECT rfp_id FROM rfp_consolidated_requirements WHERE id = ?");
+    $row->execute([$id]);
+    $existing = $row->fetch(PDO::FETCH_ASSOC);
+    if (!$existing) throw new Exception('Consolidated requirement not found');
+
+    $del = $conn->prepare("DELETE FROM rfp_consolidated_requirements WHERE id = ?");
+    $del->execute([$id]);
+
+    $conn->prepare("UPDATE rfps SET updated_datetime = CURRENT_TIMESTAMP WHERE id = ?")
+         ->execute([(int)$existing['rfp_id']]);
+
+    echo json_encode(['success' => true, 'id' => $id]);
+} catch (Exception $e) {
+    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+}

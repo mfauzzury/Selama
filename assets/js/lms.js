@@ -1,0 +1,949 @@
+/**
+ * LMS Dashboard JavaScript
+ * Handles CRUD for courses, learning groups, assignments, and progress tracking.
+ */
+const LMS = (() => {
+    let courses = [];
+    let groups = [];
+    let analysts = [];
+    let assignments = [];
+    let currentTab = 'courses';
+
+    const ICON_LAUNCH = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>';
+    const ICON_EDIT   = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>';
+    const ICON_DELETE = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>';
+    const ICON_VIEW   = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>';
+
+    // =========================================================
+    //  Init
+    // =========================================================
+    function init() {
+        loadCourses();
+        loadAnalysts();
+
+        document.getElementById('uploadForm').addEventListener('submit', uploadCourse);
+        document.getElementById('createForm').addEventListener('submit', createCourse);
+        document.getElementById('groupForm').addEventListener('submit', saveGroup);
+        document.getElementById('assignForm').addEventListener('submit', saveAssignment);
+    }
+
+    // =========================================================
+    //  Creating an authored course
+    //  Only the shell is made here — the title, the blurb and the pass mark.
+    //  The lessons are written in the editor, so we go straight there.
+    // =========================================================
+    function openCreateModal() {
+        document.getElementById('newCourseTitle').value = '';
+        document.getElementById('newCourseDescription').value = '';
+        document.getElementById('newCoursePassMark').value = '';
+        openModal('createModal');
+    }
+
+    /** Creates an authored (native) course from the New course modal through course.php and opens it in the editor. */
+    async function createCourse(e) {
+        e.preventDefault();
+        const pm = document.getElementById('newCoursePassMark').value;
+
+        const r = await fetch(API_BASE + 'course.php', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                _method: 'CREATE_NATIVE',
+                title: document.getElementById('newCourseTitle').value.trim(),
+                description: document.getElementById('newCourseDescription').value.trim(),
+                pass_mark: pm === '' ? null : parseInt(pm, 10)
+            })
+        });
+        const d = await r.json();
+        if (!d.success) { showToast(d.error, 'error'); return; }
+
+        window.location.href = 'editor.php?course_id=' + d.id;
+    }
+
+    // =========================================================
+    //  Tab switching
+    // =========================================================
+    /**
+     * The action row (#185) shows what this tab can do: Upload and New on
+     * Courses, New on Groups, Assign on Assignments, nothing on Progress.
+     */
+    function syncActionRow(tab) {
+        const show = (id, on) => { const b = document.getElementById(id); if (b) b.hidden = !on; };
+        show('lmsUploadBtn', tab === 'courses');
+        show('lmsNewBtn', tab === 'courses' || tab === 'groups');
+        show('lmsAssignBtn', tab === 'assignments');
+        const nb = document.getElementById('lmsNewBtn');
+        if (nb) {
+            const tip = window.t(tab === 'groups' ? 'lms.groups.new_tip' : 'lms.courses.new_tip');
+            nb.title = tip;
+            nb.setAttribute('aria-label', tip);
+        }
+    }
+
+    /** New in the action row: a course on Courses, a group on Groups. */
+    function newForTab() {
+        if (currentTab === 'groups') openGroupModal(); else openCreateModal();
+    }
+
+    function switchTab(tab) {
+        document.querySelectorAll('.lms-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+        document.querySelectorAll('.lms-panel').forEach(p => p.style.display = 'none');
+        document.getElementById('panel-' + tab).style.display = '';
+        currentTab = tab;
+        syncActionRow(tab);
+
+        if (tab === 'courses') loadCourses();
+        if (tab === 'groups') loadGroups();
+        if (tab === 'assignments') loadAssignments();
+        if (tab === 'progress') loadProgress();
+        // 'settings' is a static panel — the AI settings panel loads itself.
+    }
+
+    // =========================================================
+    //  Courses
+    // =========================================================
+    async function loadCourses() {
+        try {
+            const r = await fetch(API_BASE + 'courses.php');
+            const d = await r.json();
+            if (d.success) {
+                courses = d.data;
+                renderCourses();
+            }
+        } catch (e) { console.error(e); }
+    }
+
+    /**
+     * Draws the Courses table - title, SCORM version or "Authored", created date, active state, and Launch
+     * / Edit / Delete buttons (Edit only for authored courses).
+     */
+    function renderCourses() {
+        const tbody = document.getElementById('coursesBody');
+        if (!courses.length) {
+            tbody.innerHTML = '<tr><td colspan="5" class="lms-empty">' + esc(window.t('lms.courses.empty')) + '</td></tr>';
+            return;
+        }
+        tbody.innerHTML = courses.map(c => {
+            const isNative = (c.content_type || 'scorm') === 'native';
+
+            // An authored course has no SCORM version — that column shows what KIND
+            // of course it is instead, which is the more useful thing to know here.
+            const version = isNative
+                ? `<span class="native-badge">${esc(window.t('lms.courses.authored'))}</span>`
+                : (c.scorm_version
+                    ? `<span class="scorm-badge">SCORM ${esc(c.scorm_version)}</span>`
+                    : `<span style="color:#999;">${esc(window.t('lms.courses.version_unknown'))}</span>`);
+
+            const date = c.created_datetime ? fmtDate(c.created_datetime) : '';
+
+            // Only authored courses can be edited here; a SCORM package is edited in
+            // whatever tool built it, so it gets no pencil rather than a broken one.
+            const edit = isNative
+                ? `<a class="table-action-btn" href="editor.php?course_id=${c.id}" title="${esc(window.t('lms.courses.edit'))}">${ICON_EDIT}</a>`
+                : '';
+
+            return `<tr>
+                <td><strong>${esc(c.title)}</strong>${c.description ? '<br><small style="color:#888;">' + esc(c.description).substring(0, 80) + '</small>' : ''}</td>
+                <td>${version}</td>
+                <td>${date}</td>
+                <td>${c.is_active == 1 ? '<span class="lms-status completed">' + esc(window.t('lms.courses.active')) + '</span>' : '<span class="lms-status not_started">' + esc(window.t('lms.courses.inactive')) + '</span>'}</td>
+                <td class="lms-actions">
+                    <a class="table-action-btn" href="player.php?course_id=${c.id}" title="${esc(window.t('lms.courses.launch'))}">${ICON_LAUNCH}</a>
+                    ${edit}
+                    <button class="table-action-btn delete" onclick="LMS.deleteCourse(${c.id})" title="${esc(window.t('lms.courses.delete'))}">${ICON_DELETE}</button>
+                </td>
+            </tr>`;
+        }).join('');
+    }
+
+    /** Opens the SCORM upload modal with its fields and progress bar reset. */
+    function openUploadModal() {
+        document.getElementById('courseTitle').value = '';
+        document.getElementById('courseDescription').value = '';
+        document.getElementById('courseFile').value = '';
+        document.getElementById('uploadProgress').style.display = 'none';
+        document.getElementById('uploadBtn').disabled = false;
+        openModal('uploadModal');
+    }
+
+    /** Uploads a SCORM package to courses.php with a progress bar, then reloads the course list. */
+    async function uploadCourse(e) {
+        e.preventDefault();
+        const btn = document.getElementById('uploadBtn');
+        btn.disabled = true;
+
+        const formData = new FormData();
+        formData.append('title', document.getElementById('courseTitle').value);
+        formData.append('description', document.getElementById('courseDescription').value);
+        formData.append('file', document.getElementById('courseFile').files[0]);
+
+        document.getElementById('uploadProgress').style.display = '';
+        document.getElementById('uploadStatus').textContent = window.t('lms.upload_modal.uploading');
+
+        try {
+            const xhr = new XMLHttpRequest();
+            xhr.upload.addEventListener('progress', function(e) {
+                if (e.lengthComputable) {
+                    const pct = Math.round((e.loaded / e.total) * 100);
+                    document.getElementById('uploadBar').style.width = pct + '%';
+                    document.getElementById('uploadStatus').textContent = window.t('lms.upload_modal.percent_uploaded', { pct: pct });
+                }
+            });
+
+            const result = await new Promise((resolve, reject) => {
+                /** Resolves with the upload's JSON reply, or rejects when it is not valid JSON. */
+                xhr.onload = function() {
+                    try { resolve(JSON.parse(xhr.responseText)); }
+                    catch (e) { reject(new Error('Invalid response')); }
+                };
+                /** Rejects when the upload fails at the network level. */
+                xhr.onerror = function() { reject(new Error('Upload failed')); };
+                xhr.open('POST', API_BASE + 'courses.php');
+                xhr.send(formData);
+            });
+
+            if (result.success) {
+                document.getElementById('uploadStatus').textContent = window.t('lms.upload_modal.done', { version: result.scorm_version || '?' });
+                showToast(window.t('lms.toast.course_uploaded'), 'success');
+                setTimeout(() => {
+                    closeModal('uploadModal');
+                    loadCourses();
+                }, 1000);
+            } else {
+                showToast(result.error, 'error');
+                btn.disabled = false;
+            }
+        } catch (e) {
+            showToast(window.t('lms.toast.upload_failed'), 'error');
+            btn.disabled = false;
+        }
+    }
+
+    /** Deletes a course after a confirm and reloads the list. */
+    async function deleteCourse(id) {
+        if (!(await showConfirm({ title: window.t('lms.confirm.delete_title'), message: window.t('lms.confirm.delete_course'), okLabel: window.t('lms.confirm.ok_delete'), okClass: 'danger' }))) return;
+        try {
+            const r = await fetch(API_BASE + 'course.php', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id, _method: 'DELETE' })
+            });
+            const d = await r.json();
+            if (d.success) { showToast(window.t('lms.toast.deleted'), 'success'); loadCourses(); }
+            else showToast(d.error, 'error');
+        } catch (e) { showToast(window.t('lms.toast.delete_failed'), 'error'); }
+    }
+
+    // =========================================================
+    //  Learning Groups
+    // =========================================================
+    async function loadGroups() {
+        try {
+            const r = await fetch(API_BASE + 'groups.php');
+            const d = await r.json();
+            if (d.success) {
+                groups = d.data;
+                renderGroups();
+            }
+        } catch (e) { console.error(e); }
+    }
+
+    /** Draws the Learning groups table with each group's members and Edit / Delete buttons. */
+    function renderGroups() {
+        const tbody = document.getElementById('groupsBody');
+        if (!groups.length) {
+            tbody.innerHTML = '<tr><td colspan="4" class="lms-empty">' + esc(window.t('lms.groups.empty')) + '</td></tr>';
+            return;
+        }
+        tbody.innerHTML = groups.map(g => {
+            const members = (g.members || []).map(m => esc(m.full_name)).join(', ') || `<em style="color:#999;">${esc(window.t('lms.groups.no_members'))}</em>`;
+            return `<tr>
+                <td><strong>${esc(g.name)}</strong></td>
+                <td>${esc(g.description || '')}</td>
+                <td>${members}</td>
+                <td class="lms-actions">
+                    <button class="table-action-btn" onclick="LMS.editGroup(${g.id})" title="${esc(window.t('lms.groups.edit'))}">${ICON_EDIT}</button>
+                    <button class="table-action-btn delete" onclick="LMS.deleteGroup(${g.id})" title="${esc(window.t('lms.groups.delete'))}">${ICON_DELETE}</button>
+                </td>
+            </tr>`;
+        }).join('');
+    }
+
+    /** Loads the analysts for the learning group member picker. */
+    async function loadAnalysts() {
+        try {
+            const r = await fetch(API_BASE + 'analysts.php');
+            const d = await r.json();
+            if (d.success) analysts = d.data;
+        } catch (e) { console.error(e); }
+    }
+
+    /** Opens the learning group modal, new or filled from a group, with a tick box per analyst for its members. */
+    function openGroupModal(group = null) {
+        document.getElementById('groupModalTitle').textContent = group ? window.t('lms.group_modal.title_edit') : window.t('lms.group_modal.title_new');
+        document.getElementById('groupId').value = group ? group.id : '';
+        document.getElementById('groupName').value = group ? group.name : '';
+        document.getElementById('groupDescription').value = group ? (group.description || '') : '';
+
+        const memberIds = group ? (group.members || []).map(m => +m.analyst_id) : [];
+        const container = document.getElementById('membersList');
+        container.innerHTML = analysts.map(a => {
+            const checked = memberIds.includes(+a.id) ? ' checked' : '';
+            return `<label class="member-item"><input type="checkbox" value="${a.id}"${checked}> ${esc(a.full_name)} (${esc(a.username)})</label>`;
+        }).join('');
+
+        openModal('groupModal');
+    }
+
+    /** Opens the learning group modal for one group. */
+    function editGroup(id) {
+        const group = groups.find(g => g.id == id);
+        if (group) openGroupModal(group);
+    }
+
+    /**
+     * Saves the learning group modal - a new group through groups.php, an existing one through group.php
+     * (PUT) - and reloads the groups.
+     */
+    async function saveGroup(e) {
+        e.preventDefault();
+        const id = document.getElementById('groupId').value;
+        const memberIds = [...document.querySelectorAll('#membersList input:checked')].map(cb => +cb.value);
+
+        const payload = {
+            name: document.getElementById('groupName').value,
+            description: document.getElementById('groupDescription').value,
+            member_ids: memberIds
+        };
+
+        try {
+            let r;
+            if (id) {
+                payload.id = +id;
+                payload._method = 'PUT';
+                r = await fetch(API_BASE + 'group.php', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+            } else {
+                r = await fetch(API_BASE + 'groups.php', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+            }
+            const d = await r.json();
+            if (d.success) {
+                showToast(window.t('lms.toast.saved'), 'success');
+                closeModal('groupModal');
+                loadGroups();
+            } else {
+                showToast(d.error, 'error');
+            }
+        } catch (e) { showToast(window.t('lms.toast.save_failed'), 'error'); }
+    }
+
+    /** Deletes a learning group after a confirm and reloads the groups. */
+    async function deleteGroup(id) {
+        if (!(await showConfirm({ title: window.t('lms.confirm.delete_title'), message: window.t('lms.confirm.delete_group'), okLabel: window.t('lms.confirm.ok_delete'), okClass: 'danger' }))) return;
+        try {
+            const r = await fetch(API_BASE + 'group.php', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id, _method: 'DELETE' })
+            });
+            const d = await r.json();
+            if (d.success) { showToast(window.t('lms.toast.deleted'), 'success'); loadGroups(); }
+        } catch (e) { showToast(window.t('lms.toast.failed'), 'error'); }
+    }
+
+    // =========================================================
+    //  Assignments
+    // =========================================================
+    async function loadAssignments() {
+        try {
+            const r = await fetch(API_BASE + 'assignments.php');
+            const d = await r.json();
+            if (d.success) {
+                assignments = d.data;
+                renderAssignments();
+            }
+        } catch (e) { console.error(e); }
+    }
+
+    /**
+     * Draws the Assignments table - course, who it goes to, deadline, who assigned it - with Edit and
+     * Delete buttons.
+     */
+    function renderAssignments() {
+        const tbody = document.getElementById('assignmentsBody');
+        if (!assignments.length) {
+            tbody.innerHTML = '<tr><td colspan="5" class="lms-empty">' + esc(window.t('lms.assignments.empty')) + '</td></tr>';
+            return;
+        }
+        tbody.innerHTML = assignments.map(a => {
+            const deadline = a.deadline ? fmtNaiveDate(a.deadline) : `<em style="color:#999;">${esc(window.t('lms.assignments.no_deadline'))}</em>`;
+            // "Everyone on the portal" has no group row to name it, so the
+            // label is written here rather than stored — the same string the
+            // picker offered, so the two screens agree.
+            const who = a.target_type === 'all_users'
+                ? esc(window.t('lms.assignments.everyone'))
+                : esc(a.group_name || '');
+            return `<tr>
+                <td>${esc(a.course_title)}</td>
+                <td>${who}</td>
+                <td>${deadline}</td>
+                <td>${esc(a.assigned_by_name || '')}</td>
+                <td class="lms-actions">
+                    <button class="table-action-btn" onclick="LMS.openAssignModal(${a.id})" title="${esc(window.t('lms.assignments.edit'))}">${ICON_EDIT}</button>
+                    <button class="table-action-btn delete" onclick="LMS.deleteAssignment(${a.id})" title="${esc(window.t('lms.assignments.delete'))}">${ICON_DELETE}</button>
+                </td>
+            </tr>`;
+        }).join('');
+    }
+
+    /**
+     * Create, or edit an existing assignment when given its id.
+     *
+     * 🔑 THE SAME DIALOGUE FOR BOTH. Editing used to mean deleting the row and
+     * starting again — which threw away the deadline you had already typed, and
+     * left a gap during which the course reached nobody.
+     */
+    async function openAssignModal(assignmentId) {
+        // Load fresh data for dropdowns
+        if (!courses.length) await loadCourses();
+
+        const courseSelect = document.getElementById('assignCourse');
+        courseSelect.innerHTML = '<option value="">' + esc(window.t('lms.assign_modal.select_course')) + '</option>' +
+            courses.map(c => `<option value="${c.id}">${esc(c.title)}</option>`).join('');
+
+        // Everything a course can go to, in one list: the whole portal, the
+        // analyst learning groups, and the shared people groups. ONE picker
+        // rather than a kind-then-thing pair — you know you want "Finance", not
+        // which table its members are stored in.
+        //
+        // 🔑 The VALUE carries the type: "user_group:3". A bare id would be
+        // ambiguous the moment a learning group and a people group share a
+        // number, which they will, because both count from 1.
+        let targets = [];
+        try {
+            const tr = await fetch(API_BASE + 'assignment_targets.php');
+            const td = await tr.json();
+            if (td.success) targets = td.targets;
+        } catch (e) { console.error(e); }
+
+        const groupSelect = document.getElementById('assignGroup');
+        const byKind = {};
+        targets.forEach(t => { (byKind[t.kind] = byKind[t.kind] || []).push(t); });
+
+        groupSelect.innerHTML = '<option value="">' + esc(window.t('lms.assign_modal.select_group')) + '</option>' +
+            Object.keys(byKind).map(kind =>
+                `<optgroup label="${esc(kind)}">` +
+                byKind[kind].map(t =>
+                    `<option value="${esc(t.type)}:${t.id}">${esc(t.name)} (${t.member_count})</option>`
+                ).join('') +
+                `</optgroup>`
+            ).join('') +
+            // One named person. A search rather than a list, so it is one option
+            // here that reveals a box rather than thousands of options inline.
+            `<option value="person">${esc(window.t('lms.assign_modal.one_person'))}</option>`;
+
+        chosenPerson = null;
+        document.getElementById('assignPersonGroup').style.display = 'none';
+        document.getElementById('assignPersonSearch').value = '';
+        document.getElementById('assignPersonChosen').style.display = 'none';
+        document.getElementById('assignPersonResults').classList.remove('open');
+
+        editingAssignmentId = assignmentId || null;
+        const a = editingAssignmentId ? assignments.find(x => x.id == editingAssignmentId) : null;
+
+        document.getElementById('assignModalTitle').textContent =
+            window.t(a ? 'lms.assign_modal.edit_title' : 'lms.assign_modal.title');
+
+        if (a) {
+            document.getElementById('assignCourse').value = a.course_id;
+
+            if (a.target_type === 'analyst' || a.target_type === 'user') {
+                // An individual is not in the dropdown — it holds groups. Select
+                // the "one person" row and pre-fill the search with who it is.
+                groupSelect.value = 'person';
+                chosenPerson = { type: a.target_type, id: +a.group_id, name: a.group_name || '' };
+                document.getElementById('assignPersonGroup').style.display = '';
+                document.getElementById('assignPersonSearch').value = chosenPerson.name;
+                const chosen = document.getElementById('assignPersonChosen');
+                chosen.textContent = window.t('lms.assign_modal.person_chosen', { name: chosenPerson.name });
+                chosen.style.display = '';
+            } else {
+                groupSelect.value = a.target_type + ':' + a.group_id;
+            }
+
+            // The deadline is a DATE, and <input type="date"> wants exactly
+            // YYYY-MM-DD — the column carries a time as well, so trim it rather
+            // than handing the browser something it silently rejects and blanks.
+            document.getElementById('assignDeadline').value =
+                a.deadline ? String(a.deadline).slice(0, 10) : '';
+        } else {
+            document.getElementById('assignDeadline').value = '';
+        }
+
+        openModal('assignModal');
+    }
+
+    /* ---- assigning to ONE named person ---------------------------------- */
+
+    // The person picked from the search, as {type, id, name}. Null until then.
+    let chosenPerson = null;
+    let personSearchTimer = null;
+    // Which assignment the dialogue is editing, or null when creating one.
+    let editingAssignmentId = null;
+
+    /**
+     * Shows the person search in the assign modal when "a named person" is chosen, and clears the chosen
+     * person otherwise.
+     */
+    function assignTargetChanged() {
+        const isPerson = document.getElementById('assignGroup').value === 'person';
+        document.getElementById('assignPersonGroup').style.display = isPerson ? '' : 'none';
+        if (!isPerson) {
+            chosenPerson = null;
+            document.getElementById('assignPersonChosen').style.display = 'none';
+        } else {
+            document.getElementById('assignPersonSearch').focus();
+        }
+    }
+
+    /**
+     * Searches analysts and portal users for the assign modal (debounced, two characters minimum) and
+     * lists them to pick one.
+     */
+    function searchAssignPeople() {
+        clearTimeout(personSearchTimer);
+        personSearchTimer = setTimeout(async () => {
+            const box = document.getElementById('assignPersonSearch');
+            const box2 = document.getElementById('assignPersonResults');
+            const q = box.value.trim();
+            if (q.length < 2) { box2.classList.remove('open'); box2.innerHTML = ''; return; }
+            try {
+                const r = await fetch(API_BASE + 'assignment_targets.php?q=' + encodeURIComponent(q));
+                const d = await r.json();
+                if (!d.success || !d.results.length) {
+                    box2.innerHTML = `<div class="lms-person-result" style="cursor:default;">${esc(window.t('lms.assign_modal.no_people'))}</div>`;
+                    box2.classList.add('open');
+                    return;
+                }
+                box2.innerHTML = d.results.map(p =>
+                    `<div class="lms-person-result" data-type="${esc(p.type)}" data-id="${p.id}" data-name="${esc(p.name)}">
+                        ${esc(p.name)}<small>${esc(p.kind)}${p.secondary ? ' · ' + esc(p.secondary) : ''}</small>
+                     </div>`).join('');
+                box2.classList.add('open');
+                box2.querySelectorAll('.lms-person-result[data-id]').forEach(el => {
+                    el.addEventListener('click', () => {
+                        chosenPerson = { type: el.dataset.type, id: +el.dataset.id, name: el.dataset.name };
+                        box.value = chosenPerson.name;
+                        box2.classList.remove('open');
+                        const chosen = document.getElementById('assignPersonChosen');
+                        chosen.textContent = window.t('lms.assign_modal.person_chosen', { name: chosenPerson.name });
+                        chosen.style.display = '';
+                    });
+                });
+            } catch (e) { box2.classList.remove('open'); }
+        }, 300);
+    }
+
+    /**
+     * Saves the assign modal - course, target (a group, everyone, or one person) and deadline - creating
+     * through assignments.php or updating through assignment.php, then reloads.
+     */
+    async function saveAssignment(e) {
+        e.preventDefault();
+        // "user_group:3" -> {target_type:'user_group', group_id:3}. Split from
+        // the right, because only the id is guaranteed free of colons.
+        const raw = document.getElementById('assignGroup').value;
+        const cut = raw.lastIndexOf(':');
+
+        let targetType, groupId;
+        if (raw === 'person') {
+            if (!chosenPerson) { showToast(window.t('lms.assign_modal.pick_a_person'), 'error'); return; }
+            // The person's OWN table decides the target type — an analyst and a
+            // portal user are stored the same way but are not the same thing.
+            targetType = chosenPerson.type;
+            groupId    = chosenPerson.id;
+        } else {
+            targetType = cut > -1 ? raw.slice(0, cut) : 'learning_group';
+            groupId    = cut > -1 ? +raw.slice(cut + 1) : 0;
+        }
+
+        const payload = {
+            course_id: +document.getElementById('assignCourse').value,
+            target_type: targetType,
+            group_id: groupId,
+            deadline: document.getElementById('assignDeadline').value || null
+        };
+
+        // Editing goes to the single-assignment endpoint as a PUT (tunnelled in
+        // the body, as the group and course endpoints on this page already do).
+        const editing = editingAssignmentId !== null;
+        if (editing) { payload.id = editingAssignmentId; payload._method = 'PUT'; }
+
+        try {
+            const r = await fetch(API_BASE + (editing ? 'assignment.php' : 'assignments.php'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const d = await r.json();
+            if (d.success) {
+                showToast(window.t(editing ? 'lms.toast.assignment_saved' : 'lms.toast.assigned'), 'success');
+                closeModal('assignModal');
+                editingAssignmentId = null;
+                loadAssignments();
+            } else {
+                showToast(d.error, 'error');
+            }
+        } catch (e) { showToast(window.t('lms.toast.failed'), 'error'); }
+    }
+
+    /** Removes an assignment after a confirm and reloads the assignments. */
+    async function deleteAssignment(id) {
+        if (!(await showConfirm({ title: window.t('lms.confirm.delete_title'), message: window.t('lms.confirm.remove_assignment'), okLabel: window.t('lms.confirm.ok_delete'), okClass: 'danger' }))) return;
+        try {
+            const r = await fetch(API_BASE + 'assignment.php', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id, _method: 'DELETE' })
+            });
+            const d = await r.json();
+            if (d.success) { showToast(window.t('lms.toast.removed'), 'success'); loadAssignments(); }
+        } catch (e) { showToast(window.t('lms.toast.failed'), 'error'); }
+    }
+
+    // =========================================================
+    //  Progress
+    // =========================================================
+    async function loadProgress() {
+        // Populate filter dropdowns
+        if (!courses.length) await loadCourses();
+        if (!groups.length) await loadGroups();
+
+        const fc = document.getElementById('filterCourse');
+        if (fc.options.length <= 1) {
+            fc.innerHTML = '<option value="">' + esc(window.t('lms.progress.all_courses')) + '</option>' +
+                courses.map(c => `<option value="${c.id}">${esc(c.title)}</option>`).join('');
+        }
+        const fg = document.getElementById('filterGroup');
+        if (fg.options.length <= 1) {
+            fg.innerHTML = '<option value="">' + esc(window.t('lms.progress.all_groups')) + '</option>' +
+                groups.map(g => `<option value="${g.id}">${esc(g.name)}</option>`).join('');
+        }
+
+        const params = new URLSearchParams();
+        const courseId = document.getElementById('filterCourse').value;
+        const groupId = document.getElementById('filterGroup').value;
+        const analystId = document.getElementById('filterAnalyst').value;
+        const status = document.getElementById('filterStatus').value;
+        if (courseId) params.set('course_id', courseId);
+        if (groupId) params.set('group_id', groupId);
+        // A learner is now "analyst:12" or "user:257", not a bare analyst id —
+        // the two id spaces overlap, so a bare number cannot say who it means.
+        if (analystId) params.set('learner', analystId);
+        if (status) params.set('status', status);
+
+        try {
+            const r = await fetch(API_BASE + 'progress.php?' + params.toString());
+            const d = await r.json();
+            if (d.success) {
+                fillAnalystFilter(d.learners || [], analystId);
+                renderProgress(d.data);
+            }
+        } catch (e) { console.error(e); }
+    }
+
+    /* The analyst list comes back WITH the data rather than from a list of
+       every analyst in the system: it is the people the current course and
+       group selection actually covers, which is both shorter and more
+       truthful. The API builds it with those two filters applied but not the
+       analyst one, so choosing somebody does not empty the list you chose
+       them from.
+
+       Rebuilt on each load, so the current choice is re-selected by hand —
+       and kept in the list even when it has dropped out of it (a course
+       filter that excludes them), because quietly resetting to "All
+       analysts" would show rows nobody asked for. */
+    /* Takes `learners` now — analysts AND portal users — each keyed "type:id"
+       rather than by a bare id, because analyst 12 and portal user 12 are two
+       different people and a plain number cannot tell them apart. */
+    function fillAnalystFilter(learners, current) {
+        const fa = document.getElementById('filterAnalyst');
+        if (!fa) return;
+        const chosen = fa.options[fa.selectedIndex];
+        const missing = current && !learners.some(l => String(l.key) === String(current));
+        const keep = missing ? [{ key: current, name: chosen ? chosen.text : current }] : [];
+        fa.innerHTML = '<option value="">' + esc(window.t('lms.progress.all_analysts')) + '</option>' +
+            keep.concat(learners).map(l => '<option value="' + esc(l.key) + '">' + esc(l.name) + '</option>').join('');
+        fa.value = current || '';
+    }
+
+    /**
+     * Draws the Progress table - learner, course, group, status (Overdue when past the deadline), score,
+     * deadline, last access - with a View button for learners who have started.
+     */
+    function renderProgress(data) {
+        const tbody = document.getElementById('progressBody');
+        if (!data.length) {
+            tbody.innerHTML = '<tr><td colspan="8" class="lms-empty">' + esc(window.t('lms.progress.empty')) + '</td></tr>';
+            return;
+        }
+        tbody.innerHTML = data.map(row => {
+            let statusClass = row.status;
+            let statusLabel = statusText(row.status);
+            if (row.is_overdue) {
+                statusClass = 'overdue';
+                statusLabel = window.t('lms.status.overdue');
+            }
+
+            const score = row.score_raw !== null ? row.score_raw + (row.score_max ? '/' + row.score_max : '') : '';
+            const deadline = row.deadline ? fmtNaiveDate(row.deadline) : '';
+            const lastAccess = row.last_access ? fmtDateTime(row.last_access) : '';
+            /* An overdue row is marked with a CLASS, not an inline style. The
+               colour is unchanged (lms.css carries the same #fff5f5), but an
+               inline style cannot be overridden without `!important`, and the
+               mobile layer turns this row into a CARD where a near-white block
+               with the theme's own light text on it is unreadable in a dark
+               theme. A class lets each layer state its own answer. */
+            const trStyle = row.is_overdue ? ' class="lms-row-overdue"' : '';
+
+            // ⚠️ learner_key, not analyst_id. analyst_id is NULL for a portal
+            // learner, so this button used to call the drill-down with `null` on
+            // exactly the rows the portal push creates.
+            const viewBtn = row.status !== 'not_started'
+                ? `<button class="table-action-btn" onclick="LMS.viewLearnerData('${esc(row.learner_key)}', ${row.course_id})" title="${esc(window.t('lms.progress.view'))}">${ICON_VIEW}</button>`
+                : '';
+
+            return `<tr${trStyle}>
+                <td>${esc(row.learner_name || row.analyst_name)}</td>
+                <td>${esc(row.course_title)}</td>
+                <td>${esc(row.group_name)}</td>
+                <td><span class="lms-status ${statusClass}">${statusLabel}</span></td>
+                <td>${score}</td>
+                <td>${deadline}</td>
+                <td>${lastAccess}</td>
+                <td class="lms-actions">${viewBtn}</td>
+            </tr>`;
+        }).join('');
+    }
+
+    // =========================================================
+    //  Learner Data View
+    // =========================================================
+    /* `learnerKey` is "analyst:12" or "user:257". Split from the right, because
+       only the id is guaranteed free of colons. */
+    async function viewLearnerData(learnerKey, courseId) {
+        const body = document.getElementById('learnerDataBody');
+        body.innerHTML = '<div style="text-align:center; padding:40px; color:#999;">' + esc(window.t('lms.learner_modal.loading')) + '</div>';
+        openModal('learnerDataModal');
+
+        const cut  = String(learnerKey).lastIndexOf(':');
+        const type = cut > -1 ? String(learnerKey).slice(0, cut) : 'analyst';
+        const id   = cut > -1 ? String(learnerKey).slice(cut + 1) : String(learnerKey);
+
+        try {
+            const r = await fetch(API_BASE + 'learner_data.php?learner_type=' + encodeURIComponent(type)
+                                  + '&learner_id=' + encodeURIComponent(id) + '&course_id=' + courseId);
+            const d = await r.json();
+            if (!d.success) {
+                body.innerHTML = '<div style="color:#c33; padding:20px;">' + esc(d.error) + '</div>';
+                return;
+            }
+
+            const p = d.progress;
+            document.getElementById('learnerDataTitle').textContent = p.analyst_name + ' — ' + p.course_title;
+
+            let html = '';
+
+            // Summary cards
+            const statusLabel = statusText(p.status || 'not_started');
+            const scoreDisplay = p.score_raw !== null ? p.score_raw + (p.score_max ? ' / ' + p.score_max : '') : '—';
+            html += `<div class="ld-summary">
+                <div class="ld-stat"><div class="ld-stat-value"><span class="lms-status ${p.status}">${statusLabel}</span></div><div class="ld-stat-label">${esc(window.t('lms.learner_modal.stat_status'))}</div></div>
+                <div class="ld-stat"><div class="ld-stat-value">${esc(scoreDisplay)}</div><div class="ld-stat-label">${esc(window.t('lms.learner_modal.stat_score'))}</div></div>
+                <div class="ld-stat"><div class="ld-stat-value">${p.attempt_count || 0}</div><div class="ld-stat-label">${esc(window.t('lms.learner_modal.stat_attempts'))}</div></div>
+                <div class="ld-stat"><div class="ld-stat-value">${formatTime(p.total_time)}</div><div class="ld-stat-label">${esc(window.t('lms.learner_modal.stat_time_spent'))}</div></div>
+                <div class="ld-stat"><div class="ld-stat-value">${p.first_access ? fmtDate(p.first_access) : '—'}</div><div class="ld-stat-label">${esc(window.t('lms.learner_modal.stat_first_access'))}</div></div>
+                <div class="ld-stat"><div class="ld-stat-value">${p.last_access ? fmtDate(p.last_access) : '—'}</div><div class="ld-stat-label">${esc(window.t('lms.learner_modal.stat_last_access'))}</div></div>
+            </div>`;
+
+            // Interactions (quiz responses)
+            if (d.interactions.length > 0) {
+                html += `<div class="ld-section">
+                    <div class="ld-section-title">${esc(window.t('lms.learner_modal.responses'))} <span class="ld-count">${d.interactions.length}</span></div>`;
+
+                d.interactions.forEach((ix, i) => {
+                    const result = ix.result || '';
+                    let resultClass = 'neutral';
+                    if (/correct/i.test(result)) resultClass = 'correct';
+                    else if (/wrong|incorrect/i.test(result)) resultClass = 'wrong';
+
+                    html += `<div class="ld-interaction">
+                        <div class="ld-interaction-header">
+                            <span class="ld-interaction-id">${esc(ix.id || window.t('lms.learner_modal.question_n', { n: i + 1 }))}</span>
+                            ${result ? '<span class="ld-result ' + resultClass + '">' + esc(result) + '</span>' : ''}
+                        </div>`;
+
+                    if (ix.description) html += `<div class="ld-field"><span class="ld-field-label">${esc(window.t('lms.learner_modal.field_question'))}</span><span class="ld-field-value">${esc(ix.description)}</span></div>`;
+                    if (ix.type) html += `<div class="ld-field"><span class="ld-field-label">${esc(window.t('lms.learner_modal.field_type'))}</span><span class="ld-field-value">${esc(ix.type)}</span></div>`;
+                    if (ix.learner_response || ix.student_response) html += `<div class="ld-field"><span class="ld-field-label">${esc(window.t('lms.learner_modal.field_response'))}</span><span class="ld-field-value">${esc(ix.learner_response || ix.student_response)}</span></div>`;
+                    if (ix.correct_responses) html += `<div class="ld-field"><span class="ld-field-label">${esc(window.t('lms.learner_modal.field_correct'))}</span><span class="ld-field-value">${esc(ix.correct_responses)}</span></div>`;
+                    if (ix.weighting) html += `<div class="ld-field"><span class="ld-field-label">${esc(window.t('lms.learner_modal.field_weight'))}</span><span class="ld-field-value">${esc(ix.weighting)}</span></div>`;
+                    if (ix.latency) html += `<div class="ld-field"><span class="ld-field-label">${esc(window.t('lms.learner_modal.field_time_taken'))}</span><span class="ld-field-value">${esc(ix.latency)}</span></div>`;
+
+                    html += '</div>';
+                });
+
+                html += '</div>';
+            }
+
+            // Objectives
+            if (d.objectives.length > 0) {
+                html += `<div class="ld-section">
+                    <div class="ld-section-title">${esc(window.t('lms.learner_modal.objectives'))} <span class="ld-count">${d.objectives.length}</span></div>`;
+                d.objectives.forEach(obj => {
+                    const objStatus = obj.status || obj.completion_status || '';
+                    html += `<div class="ld-interaction">
+                        <div class="ld-interaction-header">
+                            <span class="ld-interaction-id">${esc(obj.id || window.t('lms.learner_modal.objective'))}</span>
+                            ${objStatus ? '<span class="lms-status ' + objStatus + '">' + esc(objStatus) + '</span>' : ''}
+                        </div>`;
+                    if (obj.description) html += `<div class="ld-field"><span class="ld-field-label">${esc(window.t('lms.learner_modal.field_description'))}</span><span class="ld-field-value">${esc(obj.description)}</span></div>`;
+                    if (obj.score_raw) html += `<div class="ld-field"><span class="ld-field-label">${esc(window.t('lms.learner_modal.field_score'))}</span><span class="ld-field-value">${esc(obj.score_raw)}${obj.score_max ? ' / ' + esc(obj.score_max) : ''}</span></div>`;
+                    html += '</div>';
+                });
+                html += '</div>';
+            }
+
+            // Suspend data
+            if (d.suspend_data_raw) {
+                html += `<div class="ld-section">
+                    <div class="ld-section-title">${esc(window.t('lms.learner_modal.suspend_data'))}</div>`;
+
+                if (d.suspend_data_decoded) {
+                    html += '<div class="ld-suspend ld-suspend-json">' + formatJson(d.suspend_data_decoded) + '</div>';
+                } else {
+                    // Try to detect and format common patterns
+                    const raw = d.suspend_data_raw;
+                    if (raw.length > 2000) {
+                        html += '<div class="ld-suspend">' + window.t('lms.learner_modal.suspend_truncated', { shown: esc(raw.substring(0, 2000)), total: raw.length }) + '</div>';
+                    } else {
+                        html += '<div class="ld-suspend">' + esc(raw) + '</div>';
+                    }
+                }
+                html += '</div>';
+            }
+
+            // All CMI data (raw key-value pairs)
+            if (d.general.length > 0) {
+                html += `<div class="ld-section">
+                    <div class="ld-section-title">${esc(window.t('lms.learner_modal.all_elements'))} <span class="ld-count">${d.general.length}</span></div>
+                    <table class="ld-kv-table">`;
+                d.general.forEach(g => {
+                    const val = g.value || '';
+                    const displayVal = val.length > 200 ? esc(val.substring(0, 200)) + '...' : esc(val);
+                    html += `<tr><td>${esc(g.element)}</td><td>${displayVal}</td></tr>`;
+                });
+                html += '</table></div>';
+            }
+
+            if (!d.interactions.length && !d.objectives.length && !d.suspend_data_raw && !d.general.length) {
+                html += '<div style="text-align:center; padding:30px; color:#999;">' + esc(window.t('lms.learner_modal.no_data')) + '</div>';
+            }
+
+            body.innerHTML = html;
+
+        } catch (e) {
+            body.innerHTML = '<div style="color:#c33; padding:20px;">' + esc(window.t('lms.learner_modal.load_failed')) + '</div>';
+        }
+    }
+
+    /** Formats a SCORM time (PT5M30S or HH:MM:SS) as a short "1h 5m" / "5m 30s" / "30s" string. */
+    function formatTime(timeStr) {
+        if (!timeStr) return '—';
+        // Handle SCORM time formats: "00:05:30" or "PT5M30S"
+        if (timeStr.startsWith('PT')) {
+            const h = (timeStr.match(/(\d+)H/) || [])[1] || 0;
+            const m = (timeStr.match(/(\d+)M/) || [])[1] || 0;
+            const s = (timeStr.match(/(\d+(?:\.\d+)?)S/) || [])[1] || 0;
+            if (+h > 0) return h + 'h ' + m + 'm';
+            if (+m > 0) return m + 'm ' + Math.round(+s) + 's';
+            return Math.round(+s) + 's';
+        }
+        // HH:MM:SS format
+        const parts = timeStr.split(':');
+        if (parts.length === 3) {
+            const h = parseInt(parts[0]);
+            const m = parseInt(parts[1]);
+            const s = Math.round(parseFloat(parts[2]));
+            if (h > 0) return h + 'h ' + m + 'm';
+            if (m > 0) return m + 'm ' + s + 's';
+            return s + 's';
+        }
+        return timeStr;
+    }
+
+    /** Pretty-prints a value as indented, colour-classed HTML JSON for the learner data viewer. */
+    function formatJson(obj, indent = 0) {
+        if (obj === null) return '<span class="ld-json-null">null</span>';
+        if (typeof obj === 'boolean') return '<span class="ld-json-bool">' + obj + '</span>';
+        if (typeof obj === 'number') return '<span class="ld-json-number">' + obj + '</span>';
+        if (typeof obj === 'string') return '<span class="ld-json-string">"' + esc(obj) + '"</span>';
+
+        const pad = '  '.repeat(indent);
+        const pad1 = '  '.repeat(indent + 1);
+
+        if (Array.isArray(obj)) {
+            if (obj.length === 0) return '[]';
+            const items = obj.map(item => pad1 + formatJson(item, indent + 1));
+            return '[\n' + items.join(',\n') + '\n' + pad + ']';
+        }
+
+        const keys = Object.keys(obj);
+        if (keys.length === 0) return '{}';
+        const entries = keys.map(k => pad1 + '<span class="ld-json-key">"' + esc(k) + '"</span>: ' + formatJson(obj[k], indent + 1));
+        return '{\n' + entries.join(',\n') + '\n' + pad + '}';
+    }
+
+    // =========================================================
+    //  Modal helpers
+    // =========================================================
+    function openModal(id) { document.getElementById(id).classList.add('active'); }
+    /** Closes a modal by id. */
+    function closeModal(id) { document.getElementById(id).classList.remove('active'); }
+
+    // =========================================================
+    //  Utilities
+    // =========================================================
+    function esc(str) {
+        if (!str) return '';
+        const div = document.createElement('div');
+        div.textContent = str;
+        return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    // Translate a normalised LMS status code to its display label. Unknown
+    // codes (e.g. SCORM-reported values without a key) fall back to a
+    // prettified version of the raw code.
+    function statusText(status) {
+        const known = ['not_started', 'incomplete', 'completed', 'passed', 'failed', 'overdue'];
+        if (known.includes(status)) return window.t('lms.status.' + status);
+        return (status || '').replace('_', ' ');
+    }
+
+    // Boot
+    document.addEventListener('DOMContentLoaded', init);
+
+    return {
+        switchTab, newForTab, openUploadModal, openCreateModal, deleteCourse,
+        openGroupModal, editGroup, deleteGroup,
+        openAssignModal, deleteAssignment, assignTargetChanged, searchAssignPeople,
+        loadProgress, viewLearnerData, closeModal
+    };
+})();

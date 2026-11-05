@@ -1,0 +1,81 @@
+services:
+  app:
+    # Builds FreeITSM from the source in this directory. That is the right default
+    # for developing, and for anyone who wants to see exactly what they are running.
+    #
+    # To run a published release instead, comment out `build: .` and use a pinned
+    # image. You then get the exact bytes that were tested for that version, and you
+    # roll back by changing the number and running `docker compose up -d`:
+    #
+    #   image: ghcr.io/edmozley/freeitsm:1.0.0
+    #
+    # `:1.0` follows the newest 1.0.x, `:1` the newest 1.x, and `:latest` the newest
+    # release of all. Pin the full number in production - `latest` moving under you
+    # is the thing version numbers exist to prevent.
+    build: .
+    ports:
+      - "8080:80"
+      # HTTPS. Only answers once a certificate has been made on System -> Docker
+      # and the container restarted. Change to "443:443" to drop the :8443 from
+      # the address, if nothing else on the host already uses port 443.
+      - "8443:443"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DB_SERVER=db
+      - DB_NAME=freeitsm
+      - DB_USERNAME=freeitsm
+      - DB_PASSWORD=freeitsm
+      - ENCRYPTION_KEY_PATH=/var/www/encryption_keys/freeitsm.key
+      # Your timezone, e.g. Europe/London or Asia/Ho_Chi_Minh. It is what analysts see
+      # until they choose their own in Preferences, and what emails sent by scheduled
+      # jobs use. Dates are always STORED in UTC; this only changes how they are shown.
+      # - TZ=Europe/London
+      # Uncomment when a reverse proxy (nginx, Traefik, Caddy, Cloudflare) terminates
+      # HTTPS in front of this container. Without it PHP sees plain HTTP and the session
+      # cookie is issued without its Secure flag. Leave it off if nothing fronts the
+      # container — X-Forwarded-Proto is client-settable, so it must never be trusted
+      # by default.
+      # - TRUST_PROXY_HTTPS=1
+      # The container runs FreeITSM's background jobs itself (SLA checks, webhooks,
+      # directory imports...). Set to 0 only if you run cron/run.php from the host.
+      # - FREEITSM_SCHEDULER=0
+      # Show PHP errors in the browser - development only. They are always logged
+      # (docker logs) either way; never turn this on for an install people use.
+      # - FREEITSM_DISPLAY_ERRORS=1
+    volumes:
+      - attachments:/var/www/html/tickets/attachments
+      - cm-attachments:/var/www/html/change-management/attachments
+      # Files module storage (uploads/files). Everything shared in Files lives here.
+      - files:/var/www/html/uploads/files
+      - encryption-keys:/var/www/encryption_keys
+      # The HTTPS certificate and the authority that signed it. Losing this
+      # means installing a new authority certificate on every PC.
+      - tls:/var/www/tls
+
+  db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: freeitsm
+      MYSQL_USER: freeitsm
+      MYSQL_PASSWORD: freeitsm
+    ports:
+      - "3307:3306"
+    volumes:
+      - db-data:/var/lib/mysql
+      - ./database/freeitsm.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  db-data:
+  attachments:
+  cm-attachments:
+  files:
+  encryption-keys:
+  tls:

@@ -1,0 +1,89 @@
+<?php
+/**
+ * Module Colours - shared helper
+ * Provides default and database-overridden module colours for dynamic CSS generation.
+ * Included by waffle-menu.php and index.php.
+ */
+
+$defaultModuleColors = [
+    'watchtower'     => ['#1e293b', '#0f172a'],
+    'tickets'        => ['#0078d4', '#106ebe'],
+    'assets'         => ['#107c10', '#0b5c0b'],
+    'knowledge'      => ['#8764b8', '#6b4fa2'],
+    'changes'        => ['#00897b', '#00695c'],
+    // Problems uses a clear red — semantically "the thing that's gone wrong" and
+    // distinct from its teal (changes) / orange (calendar) neighbours in the grid.
+    'problems'       => ['#dc2626', '#b91c1c'],
+    'calendar'       => ['#ef6c00', '#e65100'],
+    'morning-checks' => ['#00acc1', '#00838f'],
+    'reporting'      => ['#ca5010', '#a5410a'],
+    'software'       => ['#5c6bc0', '#3f51b5'],
+    'forms'          => ['#00897b', '#00695c'],
+    'contracts'      => ['#f59e0b', '#d97706'],
+    // Domains: a deep lime-olive, distinct from Assets' green and Service
+    // Status' emerald, and dark enough to carry white text in the header.
+    'domains'        => ['#4d7c0f', '#3f6212'],
+    // People (#153): a plum, apart from CMDB's pink and Tasks' violet.
+    'people'         => ['#a21caf', '#86198f'],
+    'starters'       => ['#a16207', '#854d0e'],   // golden brown - starters, movers and leavers
+    // Files: a deep navy, the colour of a desktop at night - apart from Tickets'
+    // bright blue and LMS's royal blue.
+    'files'          => ['#1e3a8a', '#172554'],
+    'service-status' => ['#10b981', '#059669'],
+    'war-room'       => ['#ea580c', '#c2410c'],
+    'wiki'           => ['#c62828', '#b71c1c'],
+    'lms'            => ['#2563eb', '#1d4ed8'],
+    'process-mapper' => ['#6366f1', '#4f46e5'],
+    'tasks'          => ['#7c3aed', '#6d28d9'],
+    // Projects (3.2.0): coral to violet, Ed's pick - a two-colour identity for the
+    // most visual module, ending near Tasks' violet because projects sit on tasks.
+    'projects'       => ['#f43f5e', '#7c3aed'],
+    'cmdb'           => ['#be185d', '#9d174d'],
+    'network-mapper' => ['#06b6d4', '#0891b2'],
+    // Workflows uses an orange distinct from contracts' amber so the two
+    // icons are tellable apart at a glance in the waffle menu, while
+    // staying in the same "automation" colour family (matches the amber
+    // accents inside the workflow module's own CSS).
+    'workflow'       => ['#ea580c', '#c2410c'],
+    'system'        => ['#546e7a', '#37474f'],
+    'checklists'    => ['#0d9488', '#0f766e'],
+];
+
+/**
+ * Every module's colour pair, the built-in defaults overridden by any module_color_* system
+ * setting.
+ *
+ * Cached per request; if the database cannot be read the defaults are returned.
+ */
+function getModuleColors() {
+    static $cached = null;
+    if ($cached !== null) {
+        return $cached;
+    }
+
+    global $defaultModuleColors;
+    $colors = $defaultModuleColors;
+
+    try {
+        if (!function_exists('connectToDatabase')) {
+            require_once __DIR__ . '/functions.php';
+        }
+        $conn = connectToDatabase();
+        $stmt = $conn->prepare("SELECT setting_key, setting_value FROM system_settings WHERE setting_key LIKE 'module_color_%'");
+        $stmt->execute();
+        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        foreach ($rows as $row) {
+            $moduleKey = substr($row['setting_key'], strlen('module_color_'));
+            $parts = explode(',', $row['setting_value']);
+            if (count($parts) === 2 && isset($colors[$moduleKey])) {
+                $colors[$moduleKey] = [trim($parts[0]), trim($parts[1])];
+            }
+        }
+    } catch (Exception) {
+        // Fall back to defaults if DB unavailable
+    }
+
+    $cached = $colors;
+    return $cached;
+}
